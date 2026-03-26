@@ -1,0 +1,719 @@
+// ===================================================================
+// File    : slave_complete.v
+// Board   : Altera DE2 (Cyclone II EP2C35F672C6) - SLAVE BOARD
+// Author  : Divyanshi Panchal (24BEC118)
+// Date    : March 2025
+// Desc    : SPI Slave implementation with LCD display on DE2 board
+//
+// All modules in one file:
+//   1. spi_synchronizer  - synchronizes all 3 async SPI input signals
+//   2. spi_slave         - main SPI slave (Mode 0 hardcoded)
+//   3. lcd_hd44780       - low level LCD driver (same as master)
+//   4. lcd_controller    - LCD message builder for slave
+//   5. seg7              - 7 segment display decoder
+//   6. spi_slave_de2_top - top level, connects everything
+//
+// Switch mapping on DE2:
+//   SW[9:2] -> 8-bit data slave will send back to master (TX)
+//   KEY[0]  -> Reset (active low)
+//
+// GPIO (JP1) pin connections - note direction is OPPOSITE to master:
+//   Pin 1 LEFT  -> SCLK  INPUT  from master  PIN_D25
+//   Pin 2 RIGHT -> MOSI  INPUT  from master  PIN_J22
+//   Pin 3 LEFT  -> CS_n  INPUT  from master  PIN_E26
+//   Pin 4 RIGHT -> MISO  OUTPUT to master    PIN_E25
+//   Pin 10 RIGHT-> GND
+//
+// LED indicators:
+//   LEDR[7:0]  = RX data received from master
+//   LEDR[8]    = CS active (transfer in progress)
+//   LEDR[9]    = valid data latch (transfer complete)
+//   LEDR[10]   = SCLK live value
+//   LEDR[11]   = MOSI live value
+//   LEDR[12]   = error flag
+//   LEDG[7:0]  = TX data (what we are sending back)
+//   LEDG[8]    = MISO live value
+// ===================================================================
+
+`timescale 1ns / 1ps
+
+
+// ===================================================================
+// MODULE 1: spi_synchronizer
+// Purpose: prevent metastability on async inputs from master board
+// Exact same design as master side - 3 flip-flop synchronizer chain
+// On slave we need to synchronize 3 signals: SCLK, CS_n, MOSI
+// ===================================================================
+module spi_synchronizer (
+    input  wire i_clk,
+    input  wire i_rst,
+    input  wire i_async_in,
+    output wire o_sync_out
+);
+    // 3 stage chain - each stage adds one clock of delay
+    (* PRESERVE *) reg sync0;
+    (* PRESERVE *) reg sync1;
+    (* PRESERVE *) reg sync2;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            sync0 <= 1'b0;
+            sync1 <= 1'b0;
+            sync2 <= 1'b0;
+        end else begin
+            sync0 <= i_async_in;
+            sync1 <= sync0;
+            sync2 <= sync1;
+        end
+    end
+
+    assign o_sync_out = sync2;  // 2 clock cycles delayed but stable
+endmodule
+
+
+// ===================================================================
+// MODULE 2: spi_slave
+//
+// The slave is much simpler than the master because:
+//   - It doesn't generate SCLK (master does)
+//   - It doesn't control CS_n (master does)
+//   - It just reacts to what master is doing
+//
+// This slave is hardcoded to SPI Mode 0 (CPOL=0, CPHA=0):
+//   - SCLK idles LOW
+//   - Sample MOSI on RISING edge of SCLK
+//   - Shift MISO on FALLING edge of SCLK
+//   - MSB first
+//
+// The i_cpol and i_cpha ports exist but are not actually used
+// (the slave always runs Mode 0 regardless)
+//
+// Edge detection is done by comparing sclk_sync to its previous
+// value (sclk_old). Same idea for cs_n.
+// ===================================================================
+module spi_slave #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire                  i_clk,
+    input  wire                  i_rst,
+    input  wire                  i_sclk,       // from master
+    input  wire                  i_cs_n,       // from master (active low)
+    input  wire                  i_mosi,       // data from master
+    output reg                   o_miso,       // data to master
+    input  wire                  i_cpol,       // not used, always Mode 0
+    input  wire                  i_cpha,       // not used, always Mode 0
+    input  wire [DATA_WIDTH-1:0] i_tx_data,   // data slave wants to send back
+    output reg  [DATA_WIDTH-1:0] o_rx_data,   // data slave received from master
+    output reg                   o_rx_valid,  // pulses high when full byte received
+    output reg                   o_err        // pulses high if CS deasserted early
+);
+    // synchronized versions of all 3 input signals
+    wire sclk_sync, cs_n_sync, mosi_sync;
+
+    // instantiate one synchronizer for each async input
+    spi_synchronizer u_sync_sclk (
+        .i_clk(i_clk), .i_rst(i_rst),
+        .i_async_in(i_sclk), .o_sync_out(sclk_sync)
+    );
+    spi_synchronizer u_sync_cs (
+        .i_clk(i_clk), .i_rst(i_rst),
+        .i_async_in(i_cs_n), .o_sync_out(cs_n_sync)
+    );
+    spi_synchronizer u_sync_mosi (
+        .i_clk(i_clk), .i_rst(i_rst),
+        .i_async_in(i_mosi), .o_sync_out(mosi_sync)
+    );
+
+    // remember previous cycle values to detect edges
+    reg sclk_old, cs_n_old;
+
+    // edge detectors - compare current synchronized value to previous
+    wire sclk_rise = ( sclk_sync && !sclk_old);  // was 0, now 1
+    wire sclk_fall = (!sclk_sync &&  sclk_old);  // was 1, now 0
+    wire cs_fall   = (!cs_n_sync &&  cs_n_old);  // CS_n went low = transfer starting
+    wire cs_rise   = ( cs_n_sync && !cs_n_old);  // CS_n went high = transfer done
+
+    // Mode 0 hardcoded: sample on rising edge, shift out on falling edge
+    wire w_sample_edge = sclk_rise;
+    wire w_shift_edge  = sclk_fall;
+
+    reg [DATA_WIDTH-1:0] tx_shift;  // what we are currently shifting out on MISO
+    reg [DATA_WIDTH-1:0] rx_shift;  // building up the received byte
+    reg [4:0]            bit_cnt;   // how many bits received so far
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            sclk_old   <= 1'b0;
+            cs_n_old   <= 1'b1;    // CS_n idles high (deasserted)
+            tx_shift   <= {DATA_WIDTH{1'b0}};
+            rx_shift   <= {DATA_WIDTH{1'b0}};
+            bit_cnt    <= 5'd0;
+            o_miso     <= 1'b0;
+            o_rx_data  <= {DATA_WIDTH{1'b0}};
+            o_rx_valid <= 1'b0;
+            o_err      <= 1'b0;
+        end else begin
+            // update previous-value registers every cycle
+            sclk_old   <= sclk_sync;
+            cs_n_old   <= cs_n_sync;
+
+            // clear single-cycle flags at start of each cycle
+            o_rx_valid <= 1'b0;
+            o_err      <= 1'b0;
+
+            if (cs_fall) begin
+                // CS just went low = master is starting a transfer
+                // load TX data and put MSB on MISO immediately (CPHA=0 behaviour)
+                bit_cnt  <= 5'd0;
+                rx_shift <= {DATA_WIDTH{1'b0}};
+                tx_shift <= i_tx_data;
+                o_miso   <= i_tx_data[DATA_WIDTH-1];        // drive MSB first
+                tx_shift <= {i_tx_data[DATA_WIDTH-2:0], 1'b0}; // rest ready to shift
+            end
+            else if (!cs_n_sync) begin
+                // CS is still low = transfer is in progress
+                if (w_sample_edge) begin
+                    // rising SCLK: sample what master sent on MOSI
+                    rx_shift <= {rx_shift[DATA_WIDTH-2:0], mosi_sync};
+                    bit_cnt  <= bit_cnt + 1'b1;
+                end
+                if (w_shift_edge) begin
+                    // falling SCLK: put next bit on MISO for master to read
+                    o_miso   <= tx_shift[DATA_WIDTH-1];
+                    tx_shift <= {tx_shift[DATA_WIDTH-2:0], 1'b0};
+                end
+            end
+            else if (cs_rise) begin
+                // CS just went high = master ended the transfer
+                if (bit_cnt == DATA_WIDTH) begin
+                    // got exactly 8 bits - valid transfer
+                    o_rx_data  <= rx_shift;
+                    o_rx_valid <= 1'b1;
+                end else if (bit_cnt != 5'd0) begin
+                    // got some bits but not 8 - something went wrong
+                    o_err <= 1'b1;
+                end
+                // if bit_cnt == 0, CS toggled without any data = ignore
+            end
+        end
+    end
+endmodule
+
+
+// ===================================================================
+// MODULE 3: lcd_hd44780
+// Purpose: low level LCD driver - identical to master board version
+//
+// Same timing requirements:
+//   - 200ms power on delay
+//   - 1us EN setup, 1us EN pulse, 500ns EN hold
+//   - 100us between normal commands
+//   - 5ms after clear (0x01) or home (0x02) commands
+// ===================================================================
+module lcd_hd44780 (
+    input  wire        i_clk,
+    input  wire        i_rst,
+    input  wire        i_write,
+    input  wire        i_rs,
+    input  wire [7:0]  i_data,
+    output reg         o_busy,
+    output reg  [7:0]  o_lcd_data,
+    output reg         o_lcd_rs,
+    output wire        o_lcd_rw,
+    output reg         o_lcd_en,
+    output wire        o_lcd_on,
+    output wire        o_lcd_blon
+);
+    assign o_lcd_rw   = 1'b0;   // always write mode
+    assign o_lcd_on   = 1'b1;   // panel always on
+    assign o_lcd_blon = 1'b1;   // backlight always on
+
+    // timing constants (50 MHz clock -> 20ns per cycle)
+    localparam POWER_ON_DELAY = 27'd10_000_000; // 200ms
+    localparam EN_SETUP_CYC   = 17'd50;         // 1us
+    localparam EN_PULSE_CYC   = 17'd50;         // 1us
+    localparam EN_HOLD_CYC    = 17'd25;         // 500ns
+    localparam NORM_WAIT_CYC  = 17'd5_000;      // 100us
+    localparam LONG_WAIT_CYC  = 17'd250_000;    // 5ms
+
+    localparam S_POWER_WAIT = 3'd0;
+    localparam S_IDLE       = 3'd1;
+    localparam S_SETUP      = 3'd2;
+    localparam S_EN_HIGH    = 3'd3;
+    localparam S_EN_LOW     = 3'd4;
+    localparam S_WAIT       = 3'd5;
+
+    reg [2:0]  state;
+    reg [26:0] power_timer;
+    reg [16:0] timer;
+    reg [16:0] wait_cycles;
+    reg [7:0]  data_lat;
+    reg        rs_lat;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            state       <= S_POWER_WAIT;
+            o_busy      <= 1'b1;
+            o_lcd_en    <= 1'b0;
+            o_lcd_rs    <= 1'b0;
+            o_lcd_data  <= 8'h00;
+            power_timer <= POWER_ON_DELAY;
+            timer       <= 17'd0;
+            data_lat    <= 8'h00;
+            rs_lat      <= 1'b0;
+            wait_cycles <= NORM_WAIT_CYC;
+        end else begin
+            case (state)
+                S_POWER_WAIT: begin
+                    o_busy   <= 1'b1;
+                    o_lcd_en <= 1'b0;
+                    if (power_timer == 27'd0) begin
+                        o_busy <= 1'b0;
+                        state  <= S_IDLE;
+                    end else
+                        power_timer <= power_timer - 1'b1;
+                end
+
+                S_IDLE: begin
+                    o_lcd_en <= 1'b0;
+                    o_busy   <= 1'b0;
+                    if (i_write) begin
+                        data_lat    <= i_data;
+                        rs_lat      <= i_rs;
+                        wait_cycles <= ((i_data == 8'h01) || (i_data == 8'h02))
+                                       ? LONG_WAIT_CYC
+                                       : NORM_WAIT_CYC;
+                        o_busy <= 1'b1;
+                        timer  <= EN_SETUP_CYC;
+                        state  <= S_SETUP;
+                    end
+                end
+
+                S_SETUP: begin
+                    o_lcd_rs   <= rs_lat;
+                    o_lcd_data <= data_lat;
+                    o_lcd_en   <= 1'b0;
+                    if (timer == 17'd0) begin
+                        o_lcd_en <= 1'b1;
+                        timer    <= EN_PULSE_CYC;
+                        state    <= S_EN_HIGH;
+                    end else
+                        timer <= timer - 1'b1;
+                end
+
+                S_EN_HIGH: begin
+                    o_lcd_en <= 1'b1;
+                    if (timer == 17'd0) begin
+                        o_lcd_en <= 1'b0;
+                        timer    <= EN_HOLD_CYC;
+                        state    <= S_EN_LOW;
+                    end else
+                        timer <= timer - 1'b1;
+                end
+
+                S_EN_LOW: begin
+                    o_lcd_en <= 1'b0;
+                    if (timer == 17'd0) begin
+                        timer <= wait_cycles;
+                        state <= S_WAIT;
+                    end else
+                        timer <= timer - 1'b1;
+                end
+
+                S_WAIT: begin
+                    if (timer == 17'd0) begin
+                        o_busy <= 1'b0;
+                        state  <= S_IDLE;
+                    end else
+                        timer <= timer - 1'b1;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+
+// ===================================================================
+// MODULE 4: lcd_controller (slave version)
+// Purpose: decide what message to show on slave's LCD
+//
+// Two screens:
+//   1. "SPI SLAVE RDY TX:0xHH   " - idle, waiting for master
+//   2. "SPI RXDONE! RX:0xHH TX:0xHH" - after a byte received
+//
+// The slave's lcd_controller is slightly simpler than master's:
+//   - No "transmitting" screen needed (slave doesn't initiate)
+//   - Just idle and done screens
+//   - i_spi_busy here is actually cs_active from top level
+//   - i_spi_done here is rx_valid from spi_slave
+// ===================================================================
+module lcd_controller (
+    input  wire        i_clk,
+    input  wire        i_rst,
+    input  wire        i_spi_busy,  // repurposed: = CS active (transfer happening)
+    input  wire        i_spi_done,  // = rx_valid (byte fully received)
+    input  wire [7:0]  i_tx_data,  // what slave is sending back
+    input  wire [7:0]  i_rx_data,  // what slave received
+    input  wire [1:0]  i_mode,     // unused on slave (always mode 0)
+    output reg         o_lcd_write,
+    output reg         o_lcd_rs,
+    output reg  [7:0]  o_lcd_data,
+    input  wire        i_lcd_busy
+);
+    localparam SEQ_LEN = 5;
+
+    localparam S_INIT_WAIT  = 4'd0;
+    localparam S_INIT_CMD   = 4'd1;
+    localparam S_WRITE_MSG  = 4'd2;
+    localparam S_IDLE       = 4'd3;
+
+    reg [3:0]  state;
+    reg [3:0]  seq_idx;
+    reg [5:0]  char_idx;
+    reg [19:0] init_timer;
+    reg        was_busy;
+    reg [7:0]  tx_lat, rx_lat;
+    reg [1:0]  mode_lat;
+
+    localparam POWER_ON_DELAY = 20'd1_000_000;
+
+    // same 5-command LCD init sequence as master
+    reg [8:0] init_seq [0:SEQ_LEN-1];
+    initial begin
+        init_seq[0] = {1'b0, 8'h38};  // 8-bit, 2 lines, 5x8 font
+        init_seq[1] = {1'b0, 8'h38};  // repeat
+        init_seq[2] = {1'b0, 8'h0C};  // display on, no cursor
+        init_seq[3] = {1'b0, 8'h01};  // clear display
+        init_seq[4] = {1'b0, 8'h06};  // auto increment, no shift
+    end
+
+    reg [7:0] msg_buf [0:33];
+    reg [5:0] msg_len;
+
+    // nibble to ASCII hex character
+    function [7:0] hex_ascii;
+        input [3:0] nibble;
+        begin
+            hex_ascii = (nibble < 4'd10) ?
+                        (8'h30 + nibble) :    // '0'..'9'
+                        (8'h37 + nibble);     // 'A'..'F'
+        end
+    endfunction
+
+    // "SPI SLAVE RDY   TX:0xHH         "
+    task build_idle_msg;
+        begin
+            msg_len     = 6'd34;
+            msg_buf[0]  = 8'h80;                    // row 1 start
+            msg_buf[1]  = "S"; msg_buf[2]  = "P";
+            msg_buf[3]  = "I"; msg_buf[4]  = " ";
+            msg_buf[5]  = "S"; msg_buf[6]  = "L";
+            msg_buf[7]  = "A"; msg_buf[8]  = "V";
+            msg_buf[9]  = "E"; msg_buf[10] = " ";
+            msg_buf[11] = "R"; msg_buf[12] = "D";
+            msg_buf[13] = "Y"; msg_buf[14] = " ";
+            msg_buf[15] = " "; msg_buf[16] = " ";
+            msg_buf[17] = 8'hC0;                    // row 2 start
+            msg_buf[18] = "T"; msg_buf[19] = "X";
+            msg_buf[20] = ":"; msg_buf[21] = "0";
+            msg_buf[22] = "x";
+            msg_buf[23] = hex_ascii(tx_lat[7:4]);   // TX upper nibble
+            msg_buf[24] = hex_ascii(tx_lat[3:0]);   // TX lower nibble
+            msg_buf[25] = " "; msg_buf[26] = " ";
+            msg_buf[27] = " "; msg_buf[28] = " ";
+            msg_buf[29] = " "; msg_buf[30] = " ";
+            msg_buf[31] = " "; msg_buf[32] = " ";
+            msg_buf[33] = " ";
+        end
+    endtask
+
+    // "SPI RXDONE!   RX:0xHH TX:0xHH  "
+    task build_done_msg;
+        begin
+            msg_len     = 6'd34;
+            msg_buf[0]  = 8'h80;
+            msg_buf[1]  = "S"; msg_buf[2]  = "P";
+            msg_buf[3]  = "I"; msg_buf[4]  = " ";
+            msg_buf[5]  = "R"; msg_buf[6]  = "X";
+            msg_buf[7]  = "D"; msg_buf[8]  = "O";
+            msg_buf[9]  = "N"; msg_buf[10] = "E";
+            msg_buf[11] = "!"; msg_buf[12] = " ";
+            msg_buf[13] = " "; msg_buf[14] = " ";
+            msg_buf[15] = " "; msg_buf[16] = " ";
+            msg_buf[17] = 8'hC0;
+            msg_buf[18] = "R"; msg_buf[19] = "X";
+            msg_buf[20] = ":"; msg_buf[21] = "0";
+            msg_buf[22] = "x";
+            msg_buf[23] = hex_ascii(rx_lat[7:4]);   // received upper nibble
+            msg_buf[24] = hex_ascii(rx_lat[3:0]);   // received lower nibble
+            msg_buf[25] = " "; msg_buf[26] = "T";
+            msg_buf[27] = "X"; msg_buf[28] = ":";
+            msg_buf[29] = "0"; msg_buf[30] = "x";
+            msg_buf[31] = hex_ascii(tx_lat[7:4]);   // sent upper nibble
+            msg_buf[32] = hex_ascii(tx_lat[3:0]);   // sent lower nibble
+            msg_buf[33] = " ";
+        end
+    endtask
+
+    reg is_cmd;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            state       <= S_INIT_WAIT;
+            seq_idx     <= 4'd0;
+            char_idx    <= 6'd0;
+            init_timer  <= POWER_ON_DELAY;
+            o_lcd_write <= 1'b0;
+            o_lcd_rs    <= 1'b0;
+            o_lcd_data  <= 8'h00;
+            was_busy    <= 1'b0;
+            tx_lat      <= 8'h00;
+            rx_lat      <= 8'h00;
+            mode_lat    <= 2'b00;
+        end else begin
+            o_lcd_write <= 1'b0;
+            was_busy    <= i_spi_busy;
+            tx_lat      <= i_tx_data;
+            rx_lat      <= i_rx_data;
+            mode_lat    <= i_mode;
+
+            case (state)
+                S_INIT_WAIT: begin
+                    if (init_timer == 20'd0)
+                        state <= S_INIT_CMD;
+                    else
+                        init_timer <= init_timer - 1'b1;
+                end
+
+                S_INIT_CMD: begin
+                    if (!i_lcd_busy && !o_lcd_write) begin
+                        if (seq_idx < SEQ_LEN) begin
+                            o_lcd_rs    <= init_seq[seq_idx][8];
+                            o_lcd_data  <= init_seq[seq_idx][7:0];
+                            o_lcd_write <= 1'b1;
+                            seq_idx     <= seq_idx + 1'b1;
+                        end else begin
+                            build_idle_msg;
+                            char_idx <= 6'd0;
+                            state    <= S_WRITE_MSG;
+                        end
+                    end
+                end
+
+                S_WRITE_MSG: begin
+                    if (!i_lcd_busy && !o_lcd_write) begin
+                        if (char_idx < msg_len) begin
+                            // positions 0 and 17 are row-select commands (RS=0)
+                            is_cmd = (char_idx == 6'd0) || (char_idx == 6'd17);
+                            o_lcd_rs    <= is_cmd ? 1'b0 : 1'b1;
+                            o_lcd_data  <= msg_buf[char_idx];
+                            o_lcd_write <= 1'b1;
+                            char_idx    <= char_idx + 1'b1;
+                        end else begin
+                            state <= S_IDLE;
+                        end
+                    end
+                end
+
+                S_IDLE: begin
+                    // priority: done message first, then busy message
+                    if (i_spi_done) begin
+                        build_done_msg;
+                        char_idx <= 6'd0;
+                        state    <= S_WRITE_MSG;
+                    end else if (i_spi_busy && !was_busy) begin
+                        // CS just went active = new transfer starting, refresh idle screen
+                        build_idle_msg;
+                        char_idx <= 6'd0;
+                        state    <= S_WRITE_MSG;
+                    end
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+
+// ===================================================================
+// MODULE 5: seg7
+// Purpose: hex to 7-segment decoder, same as master board
+// Active LOW segments (0 = ON, 1 = OFF) on DE2
+// On slave, HEX shows received (RX) data, not TX
+// ===================================================================
+module seg7 (
+    input  wire [3:0] i_hex,
+    output reg  [6:0] o_seg
+);
+    always @(*) begin
+        case (i_hex)
+            4'h0: o_seg = 7'b1000000;
+            4'h1: o_seg = 7'b1111001;
+            4'h2: o_seg = 7'b0100100;
+            4'h3: o_seg = 7'b0110000;
+            4'h4: o_seg = 7'b0011001;
+            4'h5: o_seg = 7'b0010010;
+            4'h6: o_seg = 7'b0000010;
+            4'h7: o_seg = 7'b1111000;
+            4'h8: o_seg = 7'b0000000;
+            4'h9: o_seg = 7'b0010000;
+            4'hA: o_seg = 7'b0001000;
+            4'hB: o_seg = 7'b0000011;
+            4'hC: o_seg = 7'b1000110;
+            4'hD: o_seg = 7'b0100001;
+            4'hE: o_seg = 7'b0000110;
+            4'hF: o_seg = 7'b0001110;
+            default: o_seg = 7'b1111111;  // all off
+        endcase
+    end
+endmodule
+
+
+// ===================================================================
+// MODULE 6: spi_slave_de2_top (TOP LEVEL)
+// Purpose: ties all slave modules together for the DE2 board
+//
+// Key difference from master top level:
+//   - GPIO_SCLK, GPIO_MOSI, GPIO_CS_N are INPUTS (from master)
+//   - GPIO_MISO is OUTPUT (to master)
+//   - No start button / one-shot logic needed
+//   - rx_latch holds received data persistently until next transfer
+//   - cs_active = ~GPIO_CS_N used as "busy" signal to LCD controller
+// ===================================================================
+module spi_slave_de2_top (
+    input  wire        CLOCK_50,
+    input  wire [3:0]  KEY,
+    input  wire [17:0] SW,
+    output wire [17:0] LEDR,
+    output wire [8:0]  LEDG,
+    output wire [6:0]  HEX0,
+    output wire [6:0]  HEX1,
+    output wire [7:0]  LCD_DATA,
+    output wire        LCD_RW,
+    output wire        LCD_EN,
+    output wire        LCD_RS,
+    output wire        LCD_ON,
+    output wire        LCD_BLON,
+    input  wire        GPIO_SCLK,   // INPUT on slave (opposite of master)
+    input  wire        GPIO_MOSI,   // INPUT on slave
+    input  wire        GPIO_CS_N,   // INPUT on slave
+    output wire        GPIO_MISO    // OUTPUT on slave
+);
+    assign LCD_ON   = 1'b1;
+    assign LCD_BLON = 1'b1;
+
+    wire rst      = ~KEY[0];            // KEY[0] = reset, active low
+    wire [7:0] tx_data = SW[9:2];       // data slave will send back to master
+
+    // wires from spi_slave module
+    wire       spi_miso;
+    wire [7:0] rx_data;
+    wire       rx_valid;    // pulses 1 cycle when full byte received
+    wire       rx_err;      // pulses 1 cycle if partial transfer detected
+
+    // instantiate the SPI slave (Mode 0 only)
+    spi_slave #(.DATA_WIDTH(8)) u_slave (
+        .i_clk     (CLOCK_50),
+        .i_rst     (rst),
+        .i_sclk    (GPIO_SCLK),
+        .i_cs_n    (GPIO_CS_N),
+        .i_mosi    (GPIO_MOSI),
+        .o_miso    (spi_miso),
+        .i_cpol    (1'b0),      // fixed Mode 0
+        .i_cpha    (1'b0),      // fixed Mode 0
+        .i_tx_data (tx_data),
+        .o_rx_data (rx_data),
+        .o_rx_valid(rx_valid),
+        .o_err     (rx_err)
+    );
+
+    assign GPIO_MISO = spi_miso;  // drive MISO to master
+
+    // latches to hold data persistently (rx_valid and rx_err are single-cycle pulses)
+    reg [7:0] rx_latch;    // holds the last received byte
+    reg       valid_latch; // stays high after rx_valid, cleared when CS goes active again
+    reg       err_latch;   // sticky error flag (stays until reset)
+    wire      cs_active = ~GPIO_CS_N;  // true while master has CS asserted
+
+    always @(posedge CLOCK_50) begin
+        if (rst) begin
+            rx_latch    <= 8'h00;
+            valid_latch <= 1'b0;
+            err_latch   <= 1'b0;
+        end else begin
+            if (rx_valid) begin
+                rx_latch    <= rx_data;    // capture the received byte
+                valid_latch <= 1'b1;       // flag it as valid
+            end
+            if (rx_err)
+                err_latch <= 1'b1;         // latch error flag (sticky)
+            if (cs_active)
+                valid_latch <= 1'b0;       // clear valid when new transfer starts
+        end
+    end
+
+    // LED assignments - note RX and TX are SWAPPED compared to master
+    assign LEDR[7:0]  = rx_latch;         // show what we received from master
+    assign LEDR[8]    = cs_active;        // lit during active transfer
+    assign LEDR[9]    = valid_latch;      // lit after successful receive
+    assign LEDR[10]   = GPIO_SCLK;       // SCLK coming from master (live)
+    assign LEDR[11]   = GPIO_MOSI;       // MOSI coming from master (live)
+    assign LEDR[12]   = err_latch;       // error indicator
+    assign LEDR[17:13]= 5'b00000;        // unused
+    assign LEDG[7:0]  = tx_data;         // what we are sending back (from switches)
+    assign LEDG[8]    = spi_miso;        // live MISO value we are driving
+
+    // 7-segment shows RECEIVED data (different from master which shows TX)
+    seg7 u_hex0 (.i_hex(rx_latch[3:0]), .o_seg(HEX0));  // lower nibble of RX
+    seg7 u_hex1 (.i_hex(rx_latch[7:4]), .o_seg(HEX1));  // upper nibble of RX
+
+    // internal LCD wiring
+    wire        lcd_drv_busy;
+    wire        lcd_write;
+    wire        lcd_rs_sig;
+    wire [7:0]  lcd_wdata;
+    wire [7:0]  lcd_data_out;
+    wire        lcd_rs_out;
+    wire        lcd_rw_out;
+    wire        lcd_en_out;
+
+    // LCD controller (slave version - uses cs_active as busy, rx_valid as done)
+    lcd_controller u_lcd_ctrl (
+        .i_clk      (CLOCK_50),
+        .i_rst      (rst),
+        .i_spi_busy (cs_active),   // repurposed: CS active = transfer happening
+        .i_spi_done (rx_valid),    // byte fully received = update display
+        .i_tx_data  (tx_data),     // what slave is sending back
+        .i_rx_data  (rx_latch),    // last received byte (latched)
+        .i_mode     (2'b00),       // always mode 0 on slave
+        .o_lcd_write(lcd_write),
+        .o_lcd_rs   (lcd_rs_sig),
+        .o_lcd_data (lcd_wdata),
+        .i_lcd_busy (lcd_drv_busy)
+    );
+
+    // LCD driver (low level timing - same as master)
+    lcd_hd44780 u_lcd_drv (
+        .i_clk     (CLOCK_50),
+        .i_rst     (rst),
+        .i_write   (lcd_write),
+        .i_rs      (lcd_rs_sig),
+        .i_data    (lcd_wdata),
+        .o_busy    (lcd_drv_busy),
+        .o_lcd_data(lcd_data_out),
+        .o_lcd_rs  (lcd_rs_out),
+        .o_lcd_rw  (lcd_rw_out),
+        .o_lcd_en  (lcd_en_out),
+        .o_lcd_on  (),     // not used, driven directly above
+        .o_lcd_blon()      // not used, driven directly above
+    );
+
+    assign LCD_DATA = lcd_data_out;
+    assign LCD_RS   = lcd_rs_out;
+    assign LCD_RW   = lcd_rw_out;
+    assign LCD_EN   = lcd_en_out;
+
+endmodule
