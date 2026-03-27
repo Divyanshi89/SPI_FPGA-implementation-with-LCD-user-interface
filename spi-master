@@ -2,8 +2,8 @@
 // File    : master_complete.v
 // Board   : Altera DE2 (Cyclone II EP2C35F672C6) - MASTER BOARD
 // Author  : Divyanshi Panchal (24BEC118)
-// Date    : March 2025
-// Desc    : SPI Master implementation with LCD display on DE2 board
+// Date    : 1 March 2026
+// Topic    : SPI Master implementation with LCD display on DE2 board
 //
 // All modules in one file:
 //   1. spi_synchronizer  - synchronizes async MISO signal
@@ -38,8 +38,6 @@
 //   LEDG[7:0]   = RX data received from slave
 //   LEDG[8]     = CPOL XOR CPHA (mode indicator)
 // ===================================================================
-
-`timescale 1ns / 1ps
 
 
 // ===================================================================
@@ -83,10 +81,10 @@ endmodule
 //   CLK_DIV = 2_500_000 with 50 MHz system clock
 //   SPI clock = 50MHz / (2 x 2_500_000) = 10 Hz
 //   Each full 8-bit transfer takes: 16 edges x 100ms = 1.6 seconds
-//   (slow enough to observe on LEDs)
+//  
 //
 // State machine: IDLE -> TRANSFER -> FINISH -> IDLE
-// Supports all 4 SPI modes (CPOL=0/1, CPHA=0/1)
+
 // ===================================================================
 module spi_master #(
     parameter DATA_WIDTH = 8,
@@ -131,7 +129,7 @@ module spi_master #(
     always @(posedge i_clk) begin
         if (i_rst) begin
             state      <= IDLE;
-            o_cs_n     <= 1'b1;   // CS idle = high (deasserted)
+            o_cs_n     <= 1'b1;   // CS idle = high 
             o_sclk     <= 1'b0;
             o_mosi     <= 1'b0;
             o_busy     <= 1'b0;
@@ -268,7 +266,6 @@ module lcd_hd44780 (
     output wire        o_lcd_on,
     output wire        o_lcd_blon
 );
-    // we only write to LCD, never read
     assign o_lcd_rw   = 1'b0;
     assign o_lcd_on   = 1'b1;   // keep LCD panel on
     assign o_lcd_blon = 1'b1;   // keep backlight on
